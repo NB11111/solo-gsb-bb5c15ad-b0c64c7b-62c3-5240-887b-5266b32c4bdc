@@ -860,6 +860,225 @@
     }
   });
 
+  // ---------- 批量导入交接事件（CSV） ----------
+
+  const importState = {
+    file: null,
+    preview: null, // 最近一次预览响应（含 token）
+    fileName: "",
+    busy: false,
+  };
+
+  const importModal = $("#import-modal");
+  const fileInput = $("#csv-file-input");
+
+  $("#btn-download-template").addEventListener("click", () => {
+    const a = document.createElement("a");
+    a.href = "/api/import-template";
+    a.download = "handovers_template.csv";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+
+  $("#btn-bulk-import").addEventListener("click", () => {
+    if (!state.currentId) return;
+    fileInput.value = "";
+    fileInput.click();
+  });
+
+  fileInput.addEventListener("change", async () => {
+    if (!fileInput.files || !fileInput.files[0]) return;
+    const file = fileInput.files[0];
+    await uploadPreview(file);
+  });
+
+  async function uploadFile(path, file) {
+    const form = new FormData();
+    form.append("file", file);
+    const resp = await fetch(path, { method: "POST", body: form });
+    let payload = null;
+    try {
+      payload = await resp.json();
+    } catch (_) {
+      /* 非 JSON */
+    }
+    if (!resp.ok) throw new Error(extractError(payload) || `请求失败（${resp.status}）`);
+    return payload;
+  }
+
+  async function uploadPreview(file) {
+    if (!file.name.toLowerCase().endsWith(".csv") && file.type && !file.type.includes("csv")) {
+      toast("请选择 .csv 文件（UTF-8 编码）", true);
+      return;
+    }
+    try {
+      const preview = await uploadFile(
+        `/api/samples/${state.currentId}/events/import/preview`,
+        file
+      );
+      importState.file = file;
+      importState.fileName = file.name;
+      importState.preview = preview;
+      $("#import-result").hidden = true;
+      $("#import-result").innerHTML = "";
+      renderImportPreview(preview);
+      importModal.hidden = false;
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  function auditBadgeHtml(status) {
+    const cls = ["pass", "warning", "fail"].includes(status) ? `badge-${status}` : "badge-empty";
+    return `<span class="badge ${cls}">${STATUS_LABEL[status] || status}</span>`;
+  }
+
+  function auditMiniSummary(sum) {
+    return `共 ${sum.total ?? 0} 条 · 断档 ${sum.gaps ?? 0} · 重叠 ${
+      sum.overlaps ?? 0
+    } · 起止倒置 ${sum.reversed ?? 0} · 逆序 ${sum.out_of_order ?? 0}`;
+  }
+
+  function renderImportPreview(p) {
+    $("#import-meta").innerHTML = `
+      <div class="import-meta-line">
+        文件：<b>${esc(importState.fileName)}</b>
+        <span class="muted-cell">（SHA-256 <code class="digest">${esc(p.file_sha256.slice(0, 12))}</code>…）</span>
+      </div>
+      <div class="import-meta-line">
+        解析到 <b>${p.total_rows}</b> 行数据：
+        <span class="imp-ok">${p.valid_rows} 行通过校验</span>${
+          p.error_rows ? `，<span class="imp-bad">${p.error_rows} 行存在错误</span>` : ""
+        }。
+        预览不会写入数据库；令牌有效期 ${Math.round(p.token_expires_in_seconds / 60)} 分钟，
+        期间若交接事件链发生任何增删改，确认时将被拒绝并要求重新预览。
+      </div>`;
+
+    const cur = p.current_audit;
+    const fut = p.preview_audit;
+    let compareHtml = `
+      <div class="imp-col">
+        <div class="imp-col-head">导入前审计结论</div>
+        <div>${auditBadgeHtml(cur.status)}</div>
+        <p class="imp-conclusion">${esc(cur.conclusion)}</p>
+        <div class="muted-cell">${auditMiniSummary(cur.summary)}</div>
+      </div>`;
+    if (fut) {
+      compareHtml += `
+        <div class="imp-arrow">→</div>
+        <div class="imp-col">
+          <div class="imp-col-head">确认导入后审计结论（预览模拟，未写库）</div>
+          <div>${auditBadgeHtml(fut.status)}</div>
+          <p class="imp-conclusion">${esc(fut.conclusion)}</p>
+          <div class="muted-cell">${auditMiniSummary(fut.summary)}</div>
+        </div>`;
+    } else {
+      compareHtml += `
+        <div class="imp-arrow">→</div>
+        <div class="imp-col imp-col-blocked">
+          <div class="imp-col-head">无法模拟导入后结论</div>
+          <p class="imp-conclusion imp-bad">存在未通过校验的行，请先按右侧错误提示修正 CSV 后重新上传预览；全部行有效后才能确认导入。</p>
+        </div>`;
+    }
+    $("#import-audit-compare").innerHTML = compareHtml;
+
+    const tbody = $("#import-rows-tbody");
+    tbody.innerHTML = p.rows
+      .map((r) => {
+        const endCell = r.end_time
+          ? esc(r.end_time)
+          : '<span class="open-tag">留空（仍在保管）</span>';
+        const resultCell = r.valid
+          ? '<span class="imp-ok">✓ 通过</span>'
+          : `<ul class="imp-errors">${r.errors
+              .map((e) => `<li>${esc(e)}</li>`)
+              .join("")}</ul>`;
+        return `
+        <tr class="${r.valid ? "" : "row-import-error"}">
+          <td class="col-ord">${r.line}</td>
+          <td class="col-seq">${r.seq}</td>
+          <td>${esc(r.custodian) || '<span class="muted-cell">—</span>'}</td>
+          <td>${esc(r.start_time) || '<span class="muted-cell">—</span>'}</td>
+          <td>${endCell}</td>
+          <td>${esc(r.note || "—")}</td>
+          <td>${resultCell}</td>
+        </tr>`;
+      })
+      .join("");
+
+    const btn = $("#btn-confirm-import");
+    btn.disabled = !p.all_valid || p.valid_rows === 0 || importState.busy;
+    btn.textContent = p.all_valid
+      ? `确认导入全部 ${p.valid_rows} 行`
+      : "存在错误行，无法导入";
+  }
+
+  $("#btn-close-import").addEventListener("click", () => (importModal.hidden = true));
+  importModal.addEventListener("click", (e) => {
+    if (e.target === importModal) importModal.hidden = true;
+  });
+
+  $("#btn-confirm-import").addEventListener("click", async () => {
+    if (!importState.preview || importState.busy) return;
+    if (
+      !confirm(
+        `确定将 ${importState.preview.valid_rows} 行按文件顺序一次性导入？\n` +
+          "导入将在单一事务内完成，期间事件链发生过变更会整体拒绝。"
+      )
+    )
+      return;
+    importState.busy = true;
+    const btn = $("#btn-confirm-import");
+    btn.disabled = true;
+    btn.textContent = "正在导入…";
+    try {
+      // 确认时必须重新上传同一文件并携带预览令牌
+      const form = new FormData();
+      form.append("file", importState.file);
+      form.append("token", importState.preview.token);
+      const resp = await fetch(
+        `/api/samples/${state.currentId}/events/import/confirm`,
+        { method: "POST", body: form }
+      );
+      let payload = null;
+      try {
+        payload = await resp.json();
+      } catch (_) {
+        /* 非 JSON */
+      }
+      if (!resp.ok) {
+        throw new Error(extractError(payload) || `导入失败（${resp.status}）`);
+      }
+      renderImportResult(payload);
+      await refresh();
+    } catch (err) {
+      toast(err.message, true);
+      btn.disabled = false;
+      btn.textContent = `确认导入全部 ${importState.preview.valid_rows} 行`;
+    } finally {
+      importState.busy = false;
+    }
+  });
+
+  function renderImportResult(r) {
+    const a = r.audit;
+    const zone = $("#import-result");
+    zone.hidden = false;
+    zone.innerHTML = `
+      <div class="imp-result-head imp-ok">✓ 导入成功（单一事务，已一次性提交）</div>
+      <ul class="imp-result-list">
+        <li>导入行数：<b>${r.imported_rows}</b>，按文件顺序分配录入序 <b>${r.seq_from}</b> ~ <b>${r.seq_to}</b></li>
+        <li>新增事件 id：${r.event_ids.join("、")}</li>
+        <li>因相邻关系变化而失效的既有交接确认：<b>${r.invalidated_handovers}</b> 条（原记录保留，需重新确认）</li>
+        <li>导入后审计：${auditBadgeHtml(a.status)} ${esc(a.conclusion)}</li>
+        <li class="muted-cell">${auditMiniSummary(a.summary)}</li>
+      </ul>`;
+    const btn = $("#btn-confirm-import");
+    btn.disabled = true;
+    btn.textContent = "导入已完成";
+  }
+
   // ---------- 报告导出 ----------
 
   document.querySelectorAll("[data-export]").forEach((btn) => {

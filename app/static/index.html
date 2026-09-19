@@ -165,6 +165,9 @@
           <div class="card-head">
             <h3>交接事件</h3>
             <div class="report-actions">
+              <button id="btn-download-template" class="btn btn-small" type="button">⬇ 下载 CSV 模板</button>
+              <button id="btn-bulk-import" class="btn btn-small" type="button">⤒ 批量导入 CSV</button>
+              <input type="file" id="csv-file-input" accept=".csv,text/csv" hidden />
               <label class="export-label">导出审计报告：</label>
               <button class="btn btn-small" data-export="markdown">Markdown</button>
               <button class="btn btn-small" data-export="html">HTML</button>
@@ -288,6 +291,36 @@
       <div id="handover-detail-body" class="signoff-detail"></div>
       <div class="form-actions">
         <button type="button" id="btn-close-handover-detail" class="btn btn-ghost">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 批量导入 CSV 预览弹窗 -->
+  <div id="import-modal" class="modal-mask" hidden>
+    <div class="modal modal-wide import-modal">
+      <h3>批量导入交接事件（CSV 预览）</h3>
+      <div id="import-meta" class="import-meta"></div>
+      <div id="import-audit-compare" class="import-compare"></div>
+      <div class="table-wrap import-table-wrap">
+        <table class="event-table">
+          <thead>
+            <tr>
+              <th>CSV 行号</th>
+              <th>将分配录入序</th>
+              <th>经手人</th>
+              <th>开始时间</th>
+              <th>结束时间</th>
+              <th>备注</th>
+              <th>校验结果</th>
+            </tr>
+          </thead>
+          <tbody id="import-rows-tbody"></tbody>
+        </table>
+      </div>
+      <div id="import-result" class="import-result" hidden></div>
+      <div class="form-actions">
+        <button type="button" id="btn-confirm-import" class="btn btn-primary" disabled>确认导入全部行</button>
+        <button type="button" id="btn-close-import" class="btn btn-ghost">关闭</button>
       </div>
     </div>
   </div>

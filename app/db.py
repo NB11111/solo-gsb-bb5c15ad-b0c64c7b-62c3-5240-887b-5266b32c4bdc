@@ -16,7 +16,10 @@ DB_PATH = os.environ.get("AUDIT_DB_PATH", os.path.join(os.path.dirname(__file__)
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # check_same_thread=False：FastAPI 会把同步生成器依赖（get_conn）的
+    # __enter__ / 端点 / __exit__ 分派到线程池的不同工作线程，连接在单个
+    # 请求内串行使用、不会被多线程并发共享，因此关闭跨线程检查即可。
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -33,11 +36,17 @@ def db() -> Iterator[sqlite3.Connection]:
 
 
 def get_conn() -> Iterator[sqlite3.Connection]:
-    """FastAPI 请求级依赖：请求结束自动提交并关闭连接。"""
+    """FastAPI 请求级依赖：请求结束自动提交并关闭连接。
+
+    端点可自行管理事务（如批量导入确认使用 ``BEGIN IMMEDIATE`` 并自行
+    commit / rollback）；事务结束后这里的提交为空操作，若端点已回滚
+    则不再补提交。
+    """
     conn = get_connection()
     try:
         yield conn
-        conn.commit()
+        if conn.in_transaction:
+            conn.commit()
     finally:
         conn.close()
 

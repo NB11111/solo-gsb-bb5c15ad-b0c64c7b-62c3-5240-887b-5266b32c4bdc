@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlite3 import Connection
@@ -22,6 +22,13 @@ from .handovers import (
     confirm_handover,
     get_handover_record,
     refresh_handover_validity,
+)
+from .importer import (
+    ImportFileError,
+    ImportTokenError,
+    build_preview,
+    commit_import,
+    template_csv,
 )
 from .report import build_html, build_json, build_markdown
 from .schemas import (
@@ -184,6 +191,55 @@ def delete_event(event_id: int, conn: Connection = Depends(get_conn)) -> Respons
     refresh_handover_validity(conn, sample_id)
     conn.commit()
     return Response(status_code=204)
+
+
+# ---------- 批量导入交接事件（UTF-8 CSV：预览 -> 确认） ----------
+
+@app.get("/api/import-template")
+def download_import_template() -> Response:
+    """下载 CSV 导入模板（经手人,开始时间,结束时间,备注；UTF-8 带 BOM）。"""
+    headers = {"Content-Disposition": 'attachment; filename="handovers_template.csv"'}
+    return Response(
+        content=template_csv(),
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
+    )
+
+
+@app.post("/api/samples/{sample_id}/events/import/preview")
+def preview_events_import(
+    sample_id: int,
+    file: UploadFile = File(..., description="UTF-8 CSV：经手人,开始时间,结束时间,备注"),
+    conn: Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """解析 CSV 为预览：逐行校验错误 + 导入后审计结论变化。不写库。"""
+    _fetch_sample(conn, sample_id)
+    content = file.file.read()
+    try:
+        return build_preview(conn, sample_id, content)
+    except ImportFileError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/samples/{sample_id}/events/import/confirm", status_code=201)
+def confirm_events_import(
+    sample_id: int,
+    file: UploadFile = File(..., description="与预览时完全相同的 CSV 文件"),
+    token: str = Form(..., description="预览接口返回的摘要令牌"),
+    conn: Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """携带预览令牌确认导入：单一事务内再次校验，全有效才一次性写入。"""
+    _fetch_sample(conn, sample_id)
+    content = file.file.read()
+    try:
+        result = commit_import(conn, sample_id, token, content)
+    except ImportFileError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    except ImportTokenError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    # commit_import 内部已自行管理事务（BEGIN IMMEDIATE / commit / rollback），
+    # 请求级依赖结束时的 commit 对已关闭事务为无操作。
+    return result
 
 
 # ---------- 审计 ----------
