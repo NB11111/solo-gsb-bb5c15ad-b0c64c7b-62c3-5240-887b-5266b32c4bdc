@@ -875,6 +875,240 @@
     });
   });
 
+  // ---------- 批量导入交接事件 ----------
+
+  const importState = { token: null, preview: null, fileName: "" };
+
+  const AUDIT_STATUS_LABEL = STATUS_LABEL;
+
+  function statPill(num, label, cls = "") {
+    return `<span class="ho-stat ${cls}"><b>${num}</b> ${label}</span>`;
+  }
+
+  function openImportModal() {
+    $("#import-file").value = "";
+    $("#import-summary").hidden = true;
+    $("#import-preview-wrap").hidden = true;
+    $("#import-audit-change").hidden = true;
+    $("#import-result").hidden = true;
+    $("#btn-confirm-import").disabled = true;
+    importState.token = null;
+    importState.preview = null;
+    $("#import-modal").hidden = false;
+  }
+
+  $("#btn-bulk-import").addEventListener("click", openImportModal);
+
+  $("#btn-download-template").addEventListener("click", () => {
+    const a = document.createElement("a");
+    a.href = `/api/samples/${state.currentId}/events/import-template`;
+    a.download = "";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+
+  const importModal = $("#import-modal");
+  $("#btn-close-import").addEventListener("click", () => (importModal.hidden = true));
+  importModal.addEventListener("click", (e) => {
+    if (e.target === importModal) importModal.hidden = true;
+  });
+
+  $("#btn-preview-import").addEventListener("click", async () => {
+    const fileInput = $("#import-file");
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) {
+      toast("请先选择要导入的 UTF-8 CSV 文件", true);
+      return;
+    }
+    try {
+      const buf = await file.arrayBuffer();
+      const resp = await fetch(
+        `/api/samples/${state.currentId}/events/import-preview`,
+        { method: "POST", body: buf }
+      );
+      const payload = await resp.json().catch(() => null);
+      if (!resp.ok) throw new Error(extractError(payload) || `预览失败（${resp.status}）`);
+      importState.preview = payload;
+      importState.token = payload.token;
+      importState.fileName = file.name;
+      renderImportPreview(payload);
+    } catch (err) {
+      toast(err.message, true);
+    }
+  });
+
+  function renderImportPreview(p) {
+    // 汇总条
+    const sumEl = $("#import-summary");
+    const okCls = p.all_valid ? "ok" : "bad";
+    sumEl.className = "import-summary " + (p.all_valid ? "import-ok" : "import-bad");
+    sumEl.hidden = false;
+    sumEl.innerHTML = `
+      ${statPill(p.total_rows, "数据行", "")}
+      ${statPill(p.valid_rows, "校验通过", p.all_valid && p.valid_rows ? "ok" : "muted")}
+      ${statPill(p.invalid_rows, "校验错误", p.invalid_rows ? "bad" : "muted")}
+      <span class="import-sum-msg">
+        ${p.all_valid
+          ? `全部行校验通过，录入序将按文件顺序分配为 <b>${p.rows[0].seq_preview} ~ ${p.rows[p.rows.length - 1].seq_preview}</b>`
+          : "存在校验错误的行，无法导入；请修正文件后重新预览（预览不会写库）"}
+      </span>`;
+
+    // 逐行表格
+    $("#import-preview-wrap").hidden = false;
+    $("#import-preview-tbody").innerHTML = p.rows
+      .map((r) => {
+        const end = r.end_time ? esc(r.end_time) : '<span class="open-tag">仍在保管（留空）</span>';
+        const result = r.errors.length
+          ? `<ul class="import-err-list">${r.errors.map((m) => `<li>✗ ${esc(m)}</li>`).join("")}</ul>`
+          : `<span class="import-ok-mark">✓ 校验通过</span>${
+              r.in_conflict ? `<div class="import-conflict-hint">⚠ 导入后将卷入审计冲突（见下方结论变化）</div>` : ""
+            }`;
+        return `
+        <tr class="${r.errors.length ? "import-row-err" : r.in_conflict ? "import-row-conflict" : ""}">
+          <td class="col-ord">${r.line}</td>
+          <td class="col-seq">${r.seq_preview ?? "—"}</td>
+          <td>${esc(r.custodian || "（空）")}</td>
+          <td>${esc(r.start_time || "（空）")}</td>
+          <td>${end}</td>
+          <td>${esc(r.note || "—")}</td>
+          <td>${result}</td>
+        </tr>`;
+      })
+      .join("");
+
+    renderImportAuditChange(p);
+
+    $("#import-result").hidden = true;
+    $("#btn-confirm-import").disabled = !p.all_valid;
+  }
+
+  function renderImportAuditChange(p) {
+    const el = $("#import-audit-change");
+    el.hidden = false;
+    const cur = p.current.audit;
+    const proj = p.projected.audit;
+    const curHs = p.current.handover_summary;
+    const projHs = p.projected.handover_summary;
+    const change = p.projected.handover_change;
+
+    const delta = (a, b) => {
+      const d = b - a;
+      if (d > 0) return `<span class="import-delta up">+${d}</span>`;
+      if (d < 0) return `<span class="import-delta down">${d}</span>`;
+      return `<span class="import-delta flat">±0</span>`;
+    };
+
+    const findingsHtml = p.projected.new_findings.length
+      ? `<div class="import-new-findings">
+           <div class="import-sub-lbl">导入后涉及新行的审计发现：</div>
+           <ul>${p.projected.new_findings
+             .map((f) => `<li class="finding-${f.code}"><span class="tag">${esc(FINDING_LABEL[f.code] || f.code)}</span>${esc(f.message)}</li>`)
+             .join("")}</ul>
+         </div>`
+      : `<div class="import-sub-lbl muted-cell">新行未引入断档 / 重叠 / 倒置发现。</div>`;
+
+    const invalidHtml = change.newly_invalidated
+      ? `<div class="import-invalid-warn">⚠ 导入后将有 <b>${change.newly_invalidated}</b> 条原交接确认因相邻关系变化失效（原记录保留，需两侧重新确认）</div>`
+      : `<div class="import-sub-lbl muted-cell">现有交接确认不会因本次导入失效。</div>`;
+
+    el.innerHTML = `
+      <div class="import-sub-lbl">导入后审计结论变化（预览，不写库）：</div>
+      <div class="import-compare">
+        <div class="import-side">
+          <div class="muted-cell">当前（${p.current.event_count} 条事件）</div>
+          <span class="badge badge-${cur.status}">${esc(AUDIT_STATUS_LABEL[cur.status] || cur.status)}</span>
+          <p class="import-conclusion">${esc(cur.conclusion)}</p>
+          <div class="import-mini-stats">
+            断档 ${cur.summary.gaps} · 重叠 ${cur.summary.overlaps} · 倒置 ${cur.summary.reversed} · 逆序 ${cur.summary.out_of_order}
+          </div>
+          <div class="import-mini-stats">交接确认：已确认 ${curHs.confirmed} / 待确认 ${curHs.pending} / 时间不一致 ${curHs.time_mismatch} / 失效 ${curHs.invalidated}</div>
+        </div>
+        <div class="import-arrow">➜</div>
+        <div class="import-side">
+          <div class="muted-cell">导入后（${p.projected.event_count} 条事件）</div>
+          <span class="badge badge-${proj.status}">${esc(AUDIT_STATUS_LABEL[proj.status] || proj.status)}</span>
+          <p class="import-conclusion">${esc(proj.conclusion)}</p>
+          <div class="import-mini-stats">
+            断档 ${proj.summary.gaps} ${delta(cur.summary.gaps, proj.summary.gaps)} ·
+            重叠 ${proj.summary.overlaps} ${delta(cur.summary.overlaps, proj.summary.overlaps)} ·
+            倒置 ${proj.summary.reversed} ${delta(cur.summary.reversed, proj.summary.reversed)} ·
+            逆序 ${proj.summary.out_of_order} ${delta(cur.summary.out_of_order, proj.summary.out_of_order)}
+          </div>
+          <div class="import-mini-stats">交接确认：已确认 ${projHs.confirmed} / 待确认 ${projHs.pending} / 时间不一致 ${projHs.time_mismatch} / 失效 ${projHs.invalidated} ${delta(curHs.invalidated, projHs.invalidated)}</div>
+        </div>
+      </div>
+      ${findingsHtml}
+      ${invalidHtml}`;
+  }
+
+  $("#btn-confirm-import").addEventListener("click", async () => {
+    if (!importState.token) {
+      toast("请先完成预览", true);
+      return;
+    }
+    const p = importState.preview;
+    if (
+      !confirm(
+        `确认将 ${p.valid_rows} 行按文件顺序导入（录入序 ${p.rows[0].seq_preview} ~ ${
+          p.rows[p.rows.length - 1].seq_preview
+        }）？导入在单一事务内完成，任一失败全部回滚。`
+      )
+    )
+      return;
+    const btn = $("#btn-confirm-import");
+    btn.disabled = true;
+    try {
+      const resp = await fetch(
+        `/api/samples/${state.currentId}/events/import-confirm`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token: importState.token }),
+        }
+      );
+      const payload = await resp.json().catch(() => null);
+      if (!resp.ok) {
+        btn.disabled = false;
+        throw new Error(extractError(payload) || `导入失败（${resp.status}）`);
+      }
+      renderImportResult(payload);
+      importState.token = null; // 令牌一次性使用
+      await refresh();
+    } catch (err) {
+      toast(err.message + "（数据未写入，请重新预览）", true);
+      // 链路已变化时旧预览作废
+      importState.token = null;
+      $("#btn-confirm-import").disabled = true;
+    }
+  });
+
+  function renderImportResult(res) {
+    const el = $("#import-result");
+    el.hidden = false;
+    el.className = "import-result import-ok";
+    const reasonText = {
+      event_edited: "关联事件被编辑",
+      event_deleted: "关联事件被删除",
+      adjacency_changed: "事件不再相邻",
+    };
+    const invalidDetail = res.invalidated_confirmations
+      ? `；另有 <b>${res.invalidated_confirmations}</b> 条原交接确认失效（${Object.entries(
+          res.invalidation_reasons
+        )
+          .map(([k, v]) => `${reasonText[k] || k} ${v} 条`)
+          .join("，")}），需两侧重新确认`
+      : "";
+    el.innerHTML = `
+      ✓ 导入完成：成功写入 <b>${res.imported_count}</b> 条交接事件，
+      录入序 <b>${res.first_seq} ~ ${res.last_seq}</b>${invalidDetail}。
+      <div class="import-mini-stats">导入后审计结论：
+        <span class="badge badge-${res.audit.status}">${esc(STATUS_LABEL[res.audit.status] || res.audit.status)}</span>
+        ${esc(res.audit.conclusion)}
+      </div>`;
+    $("#btn-confirm-import").disabled = true;
+  }
+
   // ---------- 启动 ----------
 
   (async function init() {

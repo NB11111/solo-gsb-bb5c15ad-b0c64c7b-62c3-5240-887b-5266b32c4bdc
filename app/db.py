@@ -16,9 +16,14 @@ DB_PATH = os.environ.get("AUDIT_DB_PATH", os.path.join(os.path.dirname(__file__)
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    # check_same_thread=False：FastAPI 异步路由与其同步依赖可能由线程池中的
+    # 不同工作线程执行；连接本身是请求级独占（请求结束即提交关闭），跨线程安全。
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # 批量导入确认以 BEGIN IMMEDIATE 抢写锁；并发请求等待而非立即报 database is locked，
+    # 排队者持锁后会因事件链指纹不匹配而被业务层拒绝（要求重新预览）
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 

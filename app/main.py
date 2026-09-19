@@ -9,12 +9,18 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
 from sqlite3 import Connection
 
 from .audit import build_audit
+from .bulk_import import (
+    CSV_HEADERS,
+    BulkImportError,
+    confirm_bulk_import,
+    preview_bulk_import,
+)
 from .db import get_conn, init_db
 from .handovers import (
     HandoverError,
@@ -25,6 +31,7 @@ from .handovers import (
 )
 from .report import build_html, build_json, build_markdown
 from .schemas import (
+    BulkImportConfirm,
     EventCreate,
     HandoverConfirm,
     SampleCreate,
@@ -184,6 +191,71 @@ def delete_event(event_id: int, conn: Connection = Depends(get_conn)) -> Respons
     refresh_handover_validity(conn, sample_id)
     conn.commit()
     return Response(status_code=204)
+
+
+# ---------- 批量导入交接事件（CSV 预览 + 确认） ----------
+
+@app.get("/api/samples/{sample_id}/events/import-template")
+def download_import_template(sample_id: int, conn: Connection = Depends(get_conn)) -> Response:
+    """下载 UTF-8 CSV 导入模板（含表头与示例行；示例行不会被自动导入）。"""
+    _fetch_sample(conn, sample_id)
+    lines = [
+        ",".join(CSV_HEADERS),
+        "张三（采集组）,2026-09-18 09:00:00,2026-09-18 10:00:00,现场采集并密封",
+        "李四（运输组）,2026-09-18 10:00:00,2026-09-18 11:30:00,冷链运输 2-8℃",
+        "王五（检测组）,2026-09-18 11:30:00,,接手后仍在保管，结束时间留空",
+    ]
+    # 写入 UTF-8 BOM，保证 Excel 直接打开中文表头不乱码
+    body = "\ufeff" + "\r\n".join(lines) + "\r\n"
+    return Response(
+        content=body.encode("utf-8"),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": "attachment; filename=handover_events_template.csv; "
+            "filename*=UTF-8''%E6%89%8B%E4%BA%A4%E4%BA%8B%E4%BB%B6%E5%AF%BC%E5%85%A5%E6%A8%A1%E6%9D%BF.csv"
+        },
+    )
+
+
+@app.post("/api/samples/{sample_id}/events/import-preview")
+async def preview_events_import(
+    sample_id: int, request: Request, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """上传 CSV -> 逐行校验与导入后审计投影；只读不写库，返回绑定事件链的摘要令牌。"""
+    _fetch_sample(conn, sample_id)
+    content = await request.body()
+    try:
+        return preview_bulk_import(conn, sample_id, content)
+    except BulkImportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/samples/{sample_id}/events/import-confirm", status_code=201)
+def confirm_events_import(
+    sample_id: int,
+    payload: BulkImportConfirm,
+    conn: Connection = Depends(get_conn),
+) -> dict[str, Any]:
+    """凭预览令牌在单一事务内再次校验并按文件顺序一次性写入。
+
+    任何校验失败都回滚整个事务，绝不部分落库。
+    """
+    try:
+        # BEGIN IMMEDIATE 立即获取写锁，杜绝「重算指纹 -> 写入」之间的并发写入
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = confirm_bulk_import(conn, sample_id, payload.token)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    except BulkImportError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+    result["sample"] = _fetch_sample(conn, sample_id)
+    result["events"] = _fetch_events(conn, sample_id)
+    result["signoffs"] = _list_signoffs(conn, sample_id)
+    return result
 
 
 # ---------- 审计 ----------

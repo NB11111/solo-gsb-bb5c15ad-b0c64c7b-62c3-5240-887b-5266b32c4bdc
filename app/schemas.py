@@ -71,6 +71,20 @@ class EventCreate(BaseModel):
         return self
 
 
+class BulkImportConfirm(BaseModel):
+    """确认批量导入：必须携带预览阶段返回的、绑定当前事件链的摘要令牌。"""
+
+    token: str = Field(..., min_length=1)
+
+    @field_validator("token")
+    @classmethod
+    def _strip_token(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("预览令牌不能为空，请先上传 CSV 并完成预览")
+        return v
+
+
 class SignoffCreate(BaseModel):
     """结论签署：在当前审计结果上生成不可变快照。"""
 
